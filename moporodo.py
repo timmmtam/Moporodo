@@ -24,12 +24,13 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from playsound import playsound
-    PLAYSOUND_AVAILABLE = True
+    import pygame
+    pygame.mixer.init()
+    PYGAME_AVAILABLE = True
 except ImportError:
-    PLAYSOUND_AVAILABLE = False
-    print("WARNING: 'playsound' library not found. Falling back to system bell for alerts.")
-    print("Install it with 'pip install playsound' for custom sound support.")
+    PYGAME_AVAILABLE = False
+    print("WARNING: 'pygame' library not found. Falling back to system bell for alerts.")
+    print("Install it with 'pip install pygame' for custom sound support.")
 
 # --- Main Application Class ---
 
@@ -46,6 +47,7 @@ class PomodoroApp:
         self.study_process = None
         self.sound_playing = False
         self.active_sound_threads = {} # Manages a thread for each alert stage sound
+        self.loaded_sounds = {} # Cache for loaded pygame sounds
         self.timer_running = False
         self.stop_monitoring = threading.Event()
         self.current_phase = "Ready"
@@ -97,10 +99,10 @@ class PomodoroApp:
 
             if not self.stop_monitoring.is_set():
                 self.current_phase = "All Cycles Complete"
-                self.root.after(0, lambda: messagebox.showinfo("Pomodoro Complete", "All Pomodoro cycles are complete!"))
+                self.root.after(0, lambda: messagebox.showinfo("Moporodo Complete", "All Moporodo cycles are complete!"))
 
         except Exception as e:
-            print(f"Error in Pomodoro session: {e}")
+            print(f"Error in Moporodo session: {e}")
             self.root.after(0, lambda: messagebox.showerror("Error", f"An error occurred: {str(e)}"))
         
         self.reset_ui()
@@ -151,15 +153,45 @@ class PomodoroApp:
 
     # --- Sound Handling ---
 
+    def _load_sound(self, sound_path):
+        """Load a sound file using pygame and cache it."""
+        if not PYGAME_AVAILABLE:
+            return None
+            
+        if sound_path == "system_bell" or not sound_path:
+            return None
+            
+        if sound_path in self.loaded_sounds:
+            return self.loaded_sounds[sound_path]
+            
+        try:
+            if os.path.exists(sound_path):
+                sound = pygame.mixer.Sound(sound_path)
+                self.loaded_sounds[sound_path] = sound
+                return sound
+            else:
+                print(f"Sound file not found: {sound_path}")
+                return None
+        except Exception as e:
+            print(f"Error loading sound '{sound_path}': {e}")
+            return None
+
     def _sound_player_loop(self, sound_path):
         """A loop to play a single sound file repeatedly. Meant to be run in a thread."""
+        sound = self._load_sound(sound_path)
+        
         while self.sound_playing:
             try:
-                if sound_path == "system_bell" or not PLAYSOUND_AVAILABLE:
+                if sound and PYGAME_AVAILABLE:
+                    # Play the sound and wait for it to finish
+                    sound.play()
+                    # Get the length of the sound to know how long to wait
+                    sound_length = sound.get_length()
+                    time.sleep(sound_length)
+                else:
+                    # Fall back to system bell
                     self.root.bell()
                     time.sleep(1)  # System bell needs a longer pause
-                else:
-                    playsound(sound_path, block=True)
             except Exception as e:
                 print(f"Error playing sound '{sound_path}': {e}. Falling back to system bell.")
                 self.root.bell()
@@ -167,7 +199,7 @@ class PomodoroApp:
 
             if not self.sound_playing:
                 break
-            time.sleep(0.1)
+            time.sleep(0.1)  # Small delay between repetitions
 
     def _manage_alert_sounds(self):
         """Manages sound threads, starting new ones for each alert stage."""
@@ -189,6 +221,10 @@ class PomodoroApp:
         
         self.sound_playing = False  # Signal all threads to stop their loops
         
+        # Stop all pygame sounds immediately
+        if PYGAME_AVAILABLE:
+            pygame.mixer.stop()
+        
         print("Stopping all sound threads...")
         for stage, thread in self.active_sound_threads.items():
             if thread.is_alive():
@@ -209,28 +245,86 @@ class PomodoroApp:
             print(f"Error getting active window: {e}")
             return None
 
-    def _start_application(self, app_path, app_title):
-        """Start an application or activate an existing instance."""
+    def _find_existing_window(self, app_title):
+        """Find an existing window that matches the app title using multiple strategies."""
+        if not app_title:
+            return None
+            
         try:
+            # Strategy 1: Exact title match
             windows = pwc.getWindowsWithTitle(app_title)
             if windows:
-                windows[0].activate()
-                print(f"Activated existing instance of: {app_title}")
-                return
+                print(f"Found exact title match for: {app_title}")
+                return windows[0]
+            
+            # Strategy 2: Partial title match (case-insensitive)
+            all_windows = pwc.getAllWindows()
+            for window in all_windows:
+                if window.title and app_title.lower() in window.title.lower():
+                    print(f"Found partial match: '{window.title}' contains '{app_title}'")
+                    return window
+            
+            # Strategy 3: Check if app title is contained within any window title
+            for window in all_windows:
+                if window.title and any(word.lower() in window.title.lower() 
+                                      for word in app_title.split() if len(word) > 2):
+                    print(f"Found keyword match: '{window.title}' matches keywords from '{app_title}'")
+                    return window
+                    
         except Exception as e:
-            print(f"Could not find or activate existing window '{app_title}': {e}")
+            print(f"Error searching for existing window '{app_title}': {e}")
+        
+        return None
 
+    def _start_application(self, app_path, app_title):
+        """Start an application or activate an existing instance."""
+        if not app_path:
+            print("No application path provided")
+            return
+            
+        # First, try to find and activate an existing window
+        existing_window = self._find_existing_window(app_title)
+        if existing_window:
+            try:
+                existing_window.activate()
+                print(f"Activated existing window: {existing_window.title}")
+                return
+            except Exception as e:
+                print(f"Failed to activate existing window: {e}")
+                # Continue to launch new instance if activation fails
+
+        # No existing window found or activation failed, launch new instance
         try:
             cmd_parts = app_path.split()
+            
+            # Verify the executable exists
+            if not os.path.exists(cmd_parts[0]):
+                print(f"Executable not found: {cmd_parts[0]}")
+                self.root.after(0, lambda: messagebox.showerror("File Not Found", 
+                    f"The executable was not found:\n{cmd_parts[0]}\n\nPlease check the path in configuration."))
+                return
+            
             process = subprocess.Popen(cmd_parts, env=os.environ)
             if "game" in app_title.lower():
                 self.game_process = process
             else:
                 self.study_process = process
             print(f"Started new instance of: {app_path}")
+            
+            # Wait a moment and try to find the newly launched window
+            time.sleep(2)
+            new_window = self._find_existing_window(app_title)
+            if new_window:
+                try:
+                    new_window.activate()
+                    print(f"Activated newly launched window: {new_window.title}")
+                except Exception as e:
+                    print(f"Failed to activate newly launched window: {e}")
+            
         except Exception as e:
             print(f"Error starting application '{app_path}': {e}")
-            self.root.after(0, lambda: messagebox.showerror("Execution Error", f"Failed to start: {app_path}\n\n{e}"))
+            self.root.after(0, lambda: messagebox.showerror("Execution Error", 
+                f"Failed to start: {app_path}\n\n{str(e)}"))
 
     def _terminate_process(self, process):
         """Safely terminate a given subprocess."""
@@ -249,7 +343,7 @@ class PomodoroApp:
     def start_pomodoro_session(self):
         """UI command to start the Pomodoro session."""
         if self.timer_running:
-            messagebox.showwarning("In Progress", "A Pomodoro session is already running.")
+            messagebox.showwarning("In Progress", "A Moporodo session is already running.")
             return
             
         self.config = self.load_config() # Reload config before starting
@@ -267,7 +361,7 @@ class PomodoroApp:
         """UI command to stop the Pomodoro session."""
         if not self.timer_running: return
         
-        if messagebox.askyesno("Confirm Stop", "Are you sure you want to stop the current Pomodoro session?"):
+        if messagebox.askyesno("Confirm Stop", "Are you sure you want to stop the current Moporodo session?"):
             self.stop_monitoring.set()
             self.timer_running = False
             self._stop_all_sounds()
@@ -278,7 +372,7 @@ class PomodoroApp:
             self.game_process = self._terminate_process(self.game_process)
             self.study_process = self._terminate_process(self.study_process)
             
-            print("Pomodoro session stopped by user.")
+            print("Moporodo session stopped by user.")
             self.reset_ui()
             
     def reset_ui(self):
@@ -305,6 +399,9 @@ class PomodoroApp:
     def on_closing(self):
         """Handle the window closing event."""
         self.stop_pomodoro_session()
+        # Clean up pygame
+        if PYGAME_AVAILABLE:
+            pygame.mixer.quit()
         self.root.destroy()
 
     # --- Configuration ---
@@ -351,6 +448,8 @@ class PomodoroApp:
         with open(self.CONFIG_FILE, "w") as configfile:
             config.write(configfile)
         
+        # Clear the sound cache when config is saved
+        self.loaded_sounds.clear()
         self.load_config() # Reload config immediately
         self.update_labels() # Update timer display with new default
 
@@ -358,8 +457,8 @@ class PomodoroApp:
 
     def setup_gui(self):
         """Create the main GUI for the application."""
-        self.root.title("Pomodoro Focus Enforcer")
-        self.root.geometry("1920x1080")
+        self.root.title("Moporodo-chan")
+        self.root.geometry("960x540")
         self.root.minsize(500, 400)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -369,7 +468,7 @@ class PomodoroApp:
         main_frame = ttk.Frame(self.root, padding="20")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(main_frame, text="Pomodoro Focus Enforcer", font=("Arial", 20, "bold")).pack(pady=(0, 20))
+        ttk.Label(main_frame, text="Moporodo Timer", font=("Arial", 20, "bold")).pack(pady=(0, 20))
         
         self.time_label = ttk.Label(main_frame, font=("Arial", 60, "bold"), foreground="darkgreen")
         self.time_label.pack(pady=10)
@@ -382,10 +481,10 @@ class PomodoroApp:
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(pady=20)
         
-        self.start_button = ttk.Button(button_frame, text="Start Pomodoro", command=self.start_pomodoro_session, style="Accent.TButton")
+        self.start_button = ttk.Button(button_frame, text="Moporodo Start!", command=self.start_pomodoro_session, style="Accent.TButton")
         self.start_button.pack(side=tk.LEFT, padx=10, ipady=10)
         
-        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_pomodoro_session)
+        self.stop_button = ttk.Button(button_frame, text="Stop :(", command=self.stop_pomodoro_session)
         self.stop_button.pack(side=tk.LEFT, padx=10, ipady=10)
         
         self.config_button = ttk.Button(button_frame, text="Configure", command=self.open_config_window)
@@ -480,7 +579,7 @@ class ConfigWindow(tk.Toplevel):
         entry.pack(side='left', fill='x', expand=True, padx=(0, 5))
         
         def browse():
-            path = filedialog.askopenfilename(filetypes=[("Audio Files", "*.mp3 *.wav"), ("All files", "*.*")])
+            path = filedialog.askopenfilename(filetypes=[("Audio Files", "*.mp3 *.wav *.ogg"), ("All files", "*.*")])
             if path: text_variable.set(path)
         
         ttk.Button(frame, text="Browse...", command=browse).pack(side='left')
